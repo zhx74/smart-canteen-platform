@@ -127,8 +127,14 @@ campus:
 management:
   endpoints:
     web:
+      # 只暴露必要的端点。env / beans / heapdump 这类敏感端点一律不开，
+      # 它们会泄露配置、Bean 结构和内存快照，是常见的入侵入口。
       exposure:
         include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      # 详情只对已认证用户展示，避免对外暴露中间件地址、连接状态等内部信息
+      show-details: when-authorized
   metrics:
     export:
       prometheus:

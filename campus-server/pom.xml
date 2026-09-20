@@ -145,6 +145,13 @@
             <artifactId>spring-dotenv</artifactId>
             <version>4.0.0</version>
         </dependency>
+        <!-- Actuator 运维端点：/actuator/** 的宿主。
+             注意：micrometer-registry-prometheus 只负责「把指标转成 Prometheus 格式」，
+             真正暴露 HTTP 端点的是这个 starter —— 两者缺一，/actuator/prometheus 都是 404。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
         <!-- Prometheus 监控 -->
         <dependency>
             <groupId>io.micrometer</groupId>
