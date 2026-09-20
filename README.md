@@ -1,202 +1,289 @@
-**项目总体架构**
+# 智慧食堂平台 · smart-canteen-platform
 
-**技术栈**
+苍穹外卖风格的校园食堂点餐系统后端。Spring Boot 3.2.5 多模块架构，覆盖订单、菜品、套餐、员工管理等完整业务链路，并针对**高并发下单**做了限流、分布式锁、缓存防击穿、消息队列削峰等工程化处理。
 
-- 开发语言：Java 17 
-- 框架：Spring Boot 3.2.5 + Spring AI 1.0.0
-- 大模型：DeepSeek Chat + DashScope Embedding
-- 构建工具：Maven（多模块）
-- 持久层框架：MyBatis 3.0.3
-- 消息队列：RabbitMQ（延时队列 x-delayed-message）
-- 缓存：Redis
-- 向量数据库：Milvus（RAG 知识库 + 长期记忆）
-- 分布式锁：Redisson
-- 限流熔断：Resilience4j
-- 实时通信：WebSocket
-- 任务调度：Spring Task（兜底容灾）
-- 接口文档：Knife4j + OpenAPI 3
-- 链路监控：Micrometer Tracing + Prometheus
+> 配套 AI 模块在独立仓库：[smart-canteen-ai](https://github.com/zhx74/smart-canteen-ai)
+> （Python + LangChain Agent + RAG 知识库 + FastAPI SSE，通过 HTTP 调用本服务的业务接口）
 
- 
+## 目录
 
-**项目结构**
+- [技术栈](#技术栈)
+- [架构设计](#架构设计)
+- [工程化亮点](#工程化亮点)
+- [快速开始](#快速开始)
+- [项目结构](#项目结构)
+- [接口文档](#接口文档)
+- [性能验证](#性能验证)
+- [已知限制](#已知限制)
 
-采用多模块Maven项目架构，实现了良好的模块解耦和代码复用 ：
+---
 
- 
+## 技术栈
 
-**详细模块分析**
+| 分类 | 技术 | 说明 |
+|---|---|---|
+| 语言 / 框架 | Java 17 · Spring Boot 3.2.5 | 多模块 Maven 工程 |
+| 持久层 | MyBatis 3.0.3 · Druid 1.2.20 · PageHelper 2.1.0 | XML 映射 + 连接池 + 物理分页 |
+| 数据库 | MySQL 8+ | 11 张业务表 |
+| 缓存 | Spring Cache · Redis · Redisson | 自研防击穿 CacheManager |
+| 消息队列 | RabbitMQ（`x-delayed-message`） | 订单超时自动取消 |
+| 分布式锁 | Redisson MultiLock | 按单品粒度加锁 |
+| 限流熔断 | Resilience4j | 下单限流 + 支付熔断 |
+| 实时通信 | WebSocket | 订单状态推送 |
+| 任务调度 | Spring Task | 派送中订单自动确认 |
+| 认证 | JWT (jjwt 0.12.3) | 管理端 / 用户端双令牌 |
+| 接口文档 | Knife4j 4.5.0 (OpenAPI 3) | 分组展示管理端 / 用户端 |
+| 可观测性 | Micrometer Tracing (Brave) · Prometheus | 链路追踪 + 指标导出 |
+| 文件存储 | 阿里云 OSS 3.10.2 | 菜品图片上传 |
+| 工具库 | Lombok · FastAPI 风格统一响应 · AspectJ | AOP 自动填充公共字段 |
 
-1. campus-common 公共模块
+## 架构设计
 
-职责：提供项目通用基础功能
+```
+smart-canteen-platform
+├── campus-common     公共模块：常量、异常、工具类、第三方配置属性
+├── campus-pojo       数据对象：DTO / Entity / VO
+└── campus-server     核心业务：controller / service / mapper / config / mq / task
+```
 
- 
+分层的意义：`campus-common` 与 `campus-pojo` **零业务依赖**，可被任何模块复用；`campus-server` 承载全部业务逻辑与基础设施配置。
 
-包结构详解：
+### 请求链路
 
-- constant/ - 系统常量定义（状态码、业务常量等）
-- context/ - 上下文管理（用户会话、线程本地变量等）
-- enumeration/ - 枚举类型（订单状态、支付方式等）
-- exception/ - 自定义异常类（业务异常、系统异常等）
-- json/ - JSON序列化配置（日期格式、字段映射等）
-- properties/ - 配置属性类（阿里云、微信等第三方配置）
-- result/ - 统一返回结果封装（成功/失败响应格式）
-- utils/ - 工具类（加密、文件处理、HTTP请求等）
+```
+Client
+  │
+  ▼
+JwtTokenAdminInterceptor / JwtTokenUserInterceptor   ← 令牌校验，写入 BaseContext(ThreadLocal)
+  │
+  ▼
+Controller (@RateLimiter / @CircuitBreaker)          ← Resilience4j 限流熔断
+  │
+  ▼
+Service  ──► Redis 缓存（AntiBreakdownCacheManager 防击穿）
+  │      └─► Redisson MultiLock（下单防重复）
+  ▼
+Mapper (MyBatis XML)
+  │
+  ▼
+MySQL
+```
 
- 
+## 工程化亮点
 
-2. campus-pojo 数据对象模块
+### 1. 下单防重复：Redisson MultiLock 按单品粒度加锁
 
-职责：定义项目中所有数据传输对象
+普通做法是给「用户」或「全局」加一把大锁，会拖垮并发。本项目改成**按购物车里的每个菜品/套餐分别加锁**，再组合成 MultiLock：
 
- 
+```java
+List<String> lockKeys = shoppingCartList.stream()
+        .map(cart -> cart.getDishId() != null
+                ? "order:dish:" + cart.getDishId()
+                : "order:setmeal:" + cart.getSetmealId())
+        .distinct()
+        .toList();
 
-包结构详解：
+RLock[] locks = lockKeys.stream().map(redissonClient::getLock).toArray(RLock[]::new);
+RLock multiLock = redissonClient.getMultiLock(locks);
+multiLock.lock();
+try {
+    // 校验库存 → 创建订单 → 写订单明细 → 清空购物车
+} finally {
+    multiLock.unlock();
+}
+```
 
-- dto/ - 数据传输对象（Data Transfer Object）
-  - 接收前端请求参数
-  - 封装查询条件
-  - 处理表单数据
-- entity/ - 数据库实体类
-  - 对应数据库表结构
-  - 包含完整的属性映射
-- vo/ - 视图对象（View Object）
-  - 返回给前端的数据格式
-  - 业务数据的展示层封装
+**收益**：不同用户点不相关的菜，锁互不冲突；只有抢同一道菜时才串行化，并发度显著高于全局锁。
 
- 
+### 2. 缓存防击穿：自定义 CacheManager + 空值占位
 
-3. campus-server 核心业务模块
+热点 key 失效瞬间，大量请求会直接打到 DB。本项目用两个手段解决：
 
-职责：实现所有业务逻辑和系统功能
+- **`CacheNullValue`** —— 查不到数据时写入一个「空值占位对象」而非不写缓存，避免同一不存在的 key 被反复穿透
+- **`AntiBreakdownCacheManager` / `AntiBreakdownRedisCache`** —— 包装 Spring 的 `RedisCacheManager`，在缓存未命中时用 Redisson 锁保证**只有一个线程回源**，其余线程等待后读缓存
 
- 
+```java
+Cache cache = delegate.getCache(n);
+if (cache instanceof RedisCache redisCache) {
+    return new AntiBreakdownRedisCache(redisCache, redissonClient);
+}
+```
 
-详细包结构：
+### 3. 订单超时取消：RabbitMQ 延时队列
 
- 
+用 `x-delayed-message` 类型的自定义交换机实现**精确到秒的延迟投递**，下单后投递一条延时消息，到期未支付则自动取消订单。
 
-- 控制层 (controller/)
-  - 管理端控制器：员工、分类、菜品、套餐管理
-  - 用户端控制器：用户注册登录、下单、购物车
-  - 公共控制器：文件上传、数据统计
-- 服务层 (service/)
-  - 业务逻辑实现：核心业务处理
-  - 数据校验：参数验证、业务规则校验
-  - 事务管理：数据一致性保证
-- 数据访问层 (mapper/)
-  - MyBatis映射器接口：数据库操作定义
-  - XML映射文件：SQL语句配置
-- 配置层 (config/)
-  - Redis配置：缓存管理
-  - OSS配置：文件存储
-  - WebMvc配置：消息转换器、拦截器注册
-  - MyBatis配置：分页插件、类型处理器
-- 切面编程 (aspect/)
-  - 操作日志切面：记录管理员操作
-  - 性能监控切面：接口耗时统计
-- 拦截器 (interceptor/)
-  - JWT令牌验证：用户身份认证
-  - 权限控制：接口访问权限
-- 异常处理 (handler/)
-  - 全局异常处理器：统一异常响应格式
-  - SQL异常处理：数据库异常转换
-- 实时通信 (websocket/)
-  - 订单状态推送：实时通知管理端
-  - 消息广播：系统通知推送
-- 定时任务 (task/)
-  - 订单状态处理：超时订单自动取消
-  - 数据清理：过期数据定时清理
-  - 核心业务功能模块
-- 基础数据管理
-  - 员工管理：登录认证、权限控制、员工信息CRUD
-  - 分类管理：菜品分类、套餐分类的层级管理
-  - 地址簿管理：用户收货地址的增删改查
+```java
+CustomExchange orderDelayedExchange() {
+    args.put("x-delayed-type", "direct");
+    return new CustomExchange(ORDER_DELAYED_EXCHANGE, "x-delayed-message", true, false, args);
+}
+```
 
- 
+比轮询 DB 的优势：不产生周期性全表扫描，延迟精度高，且天然削峰。
 
-商品管理
+> `OrderTask.processTimeOutOrder()` 作为**兜底容灾**保留（MQ 不可用时手动开启），常规链路已由延时队列接管。
 
-- 菜品管理：
-  - 菜品基本信息（名称、价格、描述、图片）
-  - 菜品口味配置（辣度、温度、规格等）
-  - 菜品状态控制（起售/停售）
-- 套餐管理：
-  - 套餐基本信息管理
-  - 套餐菜品关联管理
-  - 套餐价格策略
+### 4. 限流与熔断：Resilience4j
 
- 
+```java
+@PostMapping("/submit")
+@RateLimiter(name = "orderSubmit", fallbackMethod = "fallback")
+public Result<OrderSubmitVO> submitOrder(@RequestBody OrdersSubmitDTO dto) { ... }
 
-用户端功能
+@PutMapping("/payment")
+@CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+public Result<OrderPaymentVO> payment(@RequestBody OrdersPaymentDTO dto) { ... }
+```
 
-- 用户管理：微信登录、用户信息维护
-- 购物车：商品添加、数量调整、清空操作
+| 组件 | 实例 | 参数 |
+|---|---|---|
+| RateLimiter | `orderSubmit` | 500 次/秒，超时立即拒绝（`timeoutDuration: 0`） |
+| CircuitBreaker | `paymentService` | 失败率 >50% 熔断，10 秒后进入半开 |
 
- 
+两者都配了 `fallbackMethod`，降级时返回友好提示而非 500。
 
-- 订单管理：
-  - 订单创建（地址选择、支付方式）
-  - 订单状态跟踪（待付款、已接单、配送中等）
-  - 订单历史查询
+### 5. AOP 自动填充公共字段
 
- 
+`@AutoFill` 注解 + `AutoFillAspect`，在 INSERT / UPDATE 时自动写入 `create_time`、`update_time`、`create_user`、`update_user`，业务代码不再关心这些字段。操作人 ID 从 `BaseContext`（ThreadLocal）取。
 
-- 订单处理流程
-  - 订单详情：商品明细、价格计算、优惠处理
-  - 状态流转：从下单到完成的完整生命周期
-  - 实时通知：WebSocket推送订单状态变更
-- 配置管理
-- 多环境配置
-  - application.yml - 主配置文件
-  - application-dev.yml - 开发环境配置
-  - 支持生产、测试等多环境切换
-  - MyBatis映射配置
+## 快速开始
 
- 
+### 前置依赖
 
-包含11个核心业务的完整SQL映射：
+| 服务 | 版本 | 默认端口 |
+|---|---|---|
+| JDK | 17+ | — |
+| MySQL | 8.0+ | 3306 |
+| Redis | 6+ | 6379 |
+| RabbitMQ | 3.8+（**需装延时消息插件**） | 5672 |
+| PostgreSQL | 仅 AI 模块需要 | 5432 |
 
-- 员工、分类、菜品、套餐管理的CRUD操作
-- 用户、地址、购物车的数据操作
-- 订单及订单详情的复杂查询
+### 1. 初始化数据库
 
- 
+```bash
+mysql -uroot -p < campus_canteen.sql
+```
 
-4. campus-ai 智能客服模块
+### 2. 配置环境变量
 
-职责：通用 AI 引擎，零业务依赖，可接入任何 Spring Boot 3 系统
+```bash
+cp campus-server/src/main/resources/application.yml.example \
+   campus-server/src/main/resources/application.yml
+```
 
-核心架构：
+`application.yml` 已在 `.gitignore` 中（含 JWT 密钥），需自行创建。密码类配置统一从环境变量读取：
 
-- **ReAct Agent 引擎**
-  - 自研 Thought → Action → Observation → Final Answer 循环
-  - 正则解析 LLM 输出，按标签调度工具执行
-  - maxIterations=10 防无限循环，格式纠错重试机制
-- **Function Calling 工具调度**
-  - ToolRegistry 注册中心 + ToolProvider SPI 扩展点
-  - 内置 searchDishes / getOrderStatus / searchKnowledge 三工具
-  - 工具描述引导 LLM 精准调用，避免多余工具调用
-- **三层记忆系统**
-  - 工作记忆：LLM context window 内的当前对话
-  - 短期记忆：RedisChatMemory 滑动窗口（max 20条）+ LLM 摘要压缩，24h TTL
-  - 长期记忆：Milvus（`campus_memory` collection）语义检索 + Redis 持久化用户事实 + MemoryExtractor 自动提取，启动时从 Redis 回灌 Milvus
-- **RAG 知识检索**
-  - 启动时从 `classpath:docs/*.txt` 切片播种到 Milvus（`campus_canteen` collection）
-  - MilvusVectorStore + DashScope Embedding（1536 维），向量粗排 topK=30 + Rerank 精排
-  - KnowledgeBaseService 返回 top 3 相关片段供 Agent 引用
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `DB_HOST` / `DB_PORT` / `DB_NAME` | MySQL 地址 | `localhost` / `3306` / `campus_canteen` |
+| `DB_USERNAME` / `DB_PASSWORD` | MySQL 账号 | `root` / — |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Redis 地址 | `localhost` / `6379` / — |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` / `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` | MQ 地址 | `localhost` / `5672` / `guest` / `guest` |
+| `JWT_ADMIN_SECRET` / `JWT_USER_SECRET` | JWT 签名密钥（≥32 字节） | 开发占位值 |
+| `ALIOSS_ENDPOINT` / `ALIOSS_ACCESS_KEY_ID` / `ALIOSS_ACCESS_KEY_SECRET` / `ALIOSS_BUCKET_NAME` | 阿里云 OSS | — |
+| `WECHAT_APPID` / `WECHAT_SECRET` | 微信登录 | — |
 
-**项目特色**
+生成密钥：`openssl rand -base64 48`
 
-- 架构优势
-  - 模块化设计：清晰的分层和模块划分
-  - 代码复用：公共组件统一管理
-  - 配置外化：环境配置灵活切换
-  - 异常统一处理：规范的错误响应
-- 技术亮点
-  - JWT认证：无状态用户认证
-  - AOP切面：横切关注点统一处理
-  - WebSocket：实时双向通信
-  - RabbitMQ延时队列：实时订单超时取消（x-delayed-message），Spring Task 兜底容灾
-  - MyBatis增强：XML配置灵活的SQL操作
+### 3. 安装 RabbitMQ 延时消息插件
+
+```bash
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+### 4. 启动
+
+```bash
+mvn clean package -DskipTests
+java -jar campus-server/target/campus-server-1.0-SNAPSHOT.jar
+```
+
+或在 IDE 中运行 `CampusApplication`，默认端口 **8080**。
+
+### Docker 方式
+
+```bash
+docker compose up -d
+```
+
+## 项目结构
+
+```
+campus-server/src/main/java/com/campus/canteen/
+├── annotation/      @AutoFill 等自定义注解
+├── aspect/          AutoFillAspect —— INSERT/UPDATE 公共字段自动填充
+├── config/          Redis / RabbitMQ / OSS / WebSocket / WebMvc 配置
+│                    AntiBreakdown*  防击穿缓存实现
+├── controller/
+│   ├── admin/       管理端：员工、分类、菜品、套餐、统计报表
+│   ├── user/        用户端：登录、下单、购物车、地址簿
+│   └── notigy/      通知（WebSocket 相关）
+├── handler/         全局异常处理、SQL 异常转换
+├── interceptor/     JWT 令牌校验（管理端 / 用户端）
+├── mapper/          MyBatis Mapper 接口
+├── mq/              OrderDelayConsumer —— 延时消息消费者
+├── service/         业务接口与实现
+├── task/            OrderTask / WebSocketTask 定时任务
+└── websocket/       WebSocketServer 订单状态推送
+```
+
+数据表（11 张）：`employee` `category` `dish` `dish_flavor` `setmeal` `setmeal_dish` `user` `address_book` `shopping_cart` `orders` `order_detail`
+
+## 接口文档
+
+启动后访问 Knife4j：
+
+```
+http://localhost:8080/doc.html
+```
+
+已按管理端（`/admin/**`）与用户端（`/user/**`）分组。核心接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/user/user/login/phone` | 手机号登录，返回 JWT |
+| POST | `/user/order/submit` | 提交订单（限流） |
+| PUT | `/user/order/payment` | 订单支付（熔断） |
+| GET | `/user/order/historyOrders` | 历史订单分页 |
+| PUT | `/user/order/cancel/{id}` | 取消订单 |
+| POST | `/user/order/repetition/{id}` | 再来一单 |
+| GET | `/user/order/reminder/{id}` | 客户催单 |
+
+## 性能验证
+
+针对订单表做过完整的慢 SQL 定位与索引优化，测试环境灌入 **102.4 万行**订单数据 + 20 万行订单明细（表数据 158.7MB，`innodb_buffer_pool_size` 仅 128MB），用 `EXPLAIN ANALYZE` 采集真实执行耗时。
+
+| 场景 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|
+| 查用户最近 10 单<br>`WHERE user_id=? ORDER BY order_time DESC LIMIT 10` | 951 ms<br>（全表扫 + filesort） | **0.072 ms**<br>（`ref` + Backward index scan） | ≈ 13000× |
+| 销量 Top10 关联查询<br>`order_detail JOIN orders` + 时间范围 | 506 ms<br>（`Using temporary`） | **22.3 ms**<br>（驱动表换为 orders） | ≈ 23× |
+
+建立的索引：
+
+```sql
+ALTER TABLE orders       ADD INDEX idx_user_time   (user_id, order_time);
+ALTER TABLE orders       ADD INDEX idx_status_time (status, order_time);
+ALTER TABLE order_detail ADD INDEX idx_order_id    (order_id);
+```
+
+> 索引列顺序遵循最左前缀：等值条件列在前（定位），排序/范围列在后（借有序性消除 filesort）。
+
+**一个反直觉的发现**：`SELECT * FROM orders WHERE status=1 AND order_time < ?` 这条 SQL，**加了 `idx_status_time` 后优化器依然选择全表扫描**（988ms），强制走索引反而慢到 **6379ms**。原因是 `status` 基数只有 7，单值命中 14.6 万行（14.3%），且 `SELECT *` 不被索引覆盖 → 每行都要回表随机读，代价高于顺序全表扫描。改成覆盖查询 `SELECT COUNT(*)` 后降至 **33.4ms**。
+
+> **结论**：索引不是加了就一定快，低基数等值列 + 非覆盖 `SELECT *` 时回表随机 I/O 会让索引成为负优化。
+
+## 已知限制
+
+以下几点是当前实现的边界，列出以明确后续演进方向：
+
+- **Actuator 端点未开通** —— 已引入 `micrometer-registry-prometheus`，但缺少 `spring-boot-starter-actuator`，`/actuator/prometheus` 暂不可访问
+- **索引未固化到建表脚本** —— 上述三个索引仅在测试库验证，尚未写入 `campus_canteen.sql`
+- **`OrderTask.processDeliveryOrder` 仍是逐条 `update`** —— 订单量大时应改为批量更新
+- **`cancelReason` 语义复用** —— 「派送中→已完成」场景也写入了 `cancelReason`，字段语义应与「取消原因」区分
+- **单元测试覆盖不足** —— 目前仅 `DishServiceImplTest` 一个测试类
+- **AI 模块已剥离** —— 原 `campus-ai` 模块迁移至独立仓库 [smart-canteen-ai](https://github.com/zhx74/smart-canteen-ai)
+
+## License
+
+MIT
