@@ -14,6 +14,7 @@
 - [项目结构](#项目结构)
 - [接口文档](#接口文档)
 - [性能验证](#性能验证)
+- [运行监控](#运行监控)
 - [已知限制](#已知限制)
 
 ---
@@ -273,11 +274,37 @@ ALTER TABLE order_detail ADD INDEX idx_order_id    (order_id);
 
 > **结论**：索引不是加了就一定快，低基数等值列 + 非覆盖 `SELECT *` 时回表随机 I/O 会让索引成为负优化。
 
+## 运行监控
+
+接入 Spring Boot Actuator，暴露 4 个运维端点（`/actuator/**`）：
+
+| 端点 | 内容 |
+|---|---|
+| `/actuator/health` | 应用与中间件整体健康状态，`{"status":"UP"}` |
+| `/actuator/info` | 应用元信息 |
+| `/actuator/metrics` | **76 个指标**的查询入口，支持 `/metrics/{name}` 取单项 |
+| `/actuator/prometheus` | 全部指标的 Prometheus 文本格式（316 行），可直接对接 Prometheus + Grafana |
+
+实测可读的关键指标：
+
+| 指标 | 用途 |
+|---|---|
+| `jvm.memory.used` | 堆 / 非堆各内存池占用（排查内存泄漏、OOM 的主指标） |
+| `jvm.gc.pause` | GC 停顿次数 `COUNT` / 累计 `TOTAL_TIME` / 单次最大 `MAX` |
+| `http.server.requests` | 按 URI 维度的请求耗时，可取 P95 / P99 |
+| `resilience4j.circuitbreaker.*` | 熔断器状态、失败率、慢调用率 |
+| `resilience4j.ratelimiter.*` | 限流器可用令牌数、等待线程数 |
+| `rabbitmq.*` | 连接数、发布 / 消费 / 拒绝消息数 |
+| `tomcat.sessions.*` | 会话数、拒绝数 |
+
+**安全约束**：仅暴露上表 4 个端点，`env` / `beans` / `heapdump` 这类会泄露配置、Bean 结构与内存快照的敏感端点一律不开；`health` 详情设为 `when-authorized`，避免对外暴露中间件地址。
+
+> 注意：`micrometer-registry-prometheus` 只负责**把指标转成 Prometheus 格式**，真正暴露 HTTP 端点的是 `spring-boot-starter-actuator`。两者缺一，`/actuator/prometheus` 都是 404。
+
 ## 已知限制
 
 以下几点是当前实现的边界，列出以明确后续演进方向：
 
-- **Actuator 端点未开通** —— 已引入 `micrometer-registry-prometheus`，但缺少 `spring-boot-starter-actuator`，`/actuator/prometheus` 暂不可访问
 - **索引未固化到建表脚本** —— 上述三个索引仅在测试库验证，尚未写入 `campus_canteen.sql`
 - **`OrderTask.processDeliveryOrder` 仍是逐条 `update`** —— 订单量大时应改为批量更新
 - **`cancelReason` 语义复用** —— 「派送中→已完成」场景也写入了 `cancelReason`，字段语义应与「取消原因」区分
