@@ -1,0 +1,8 @@
+services:
+  mysql:
+    ports: !override
+      - "3307:3306"     # 左本机 / 右容器内，避开本机的 3306
+  rabbitmq:
+    ports: !override
+      - "5673:5672"     # 避开本机的 5672
+      - "15673:15672"

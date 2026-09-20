@@ -1,0 +1,155 @@
+# ============================================================
+# 智慧食堂平台 · 主配置模板
+#
+# 用法：
+#    cp application.yml.example application.yml
+#    # 然后按需修改（敏感值建议走环境变量，见 application-dev.yml）
+#
+# 说明：
+#   真实 application.yml 已被 .gitignore 忽略（含 JWT 密钥）。
+#   本文件只作为模板提交，所有敏感字段均为占位符。
+# ============================================================
+
+server:
+  port: 8080
+
+spring:
+  profiles:
+    # 切 dev 走 application-dev.yml（真实密码从环境变量读取）
+    active: dev
+  main:
+    allow-circular-references: true
+  autoconfigure:
+    exclude:
+      - org.redisson.spring.starter.RedissonAutoConfiguration
+  datasource:
+    # 具体值在 application-dev.yml 里以 ${ENV:default} 形式提供
+    driver-class-name: ${campus.canteen.datasource.driver-class-name}
+    url: jdbc:mysql://${campus.canteen.datasource.host}:${campus.canteen.datasource.port}/${campus.canteen.datasource.database}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${campus.canteen.datasource.username}
+    password: ${campus.canteen.datasource.password}
+    type: com.alibaba.druid.pool.DruidDataSource
+    druid:
+  redis:
+    host: ${campus.canteen.redis.host}
+    port: ${campus.canteen.redis.port}
+    password: ${campus.canteen.redis.password}
+    database: ${campus.canteen.redis.database}
+
+  rabbitmq:
+    host: ${campus.canteen.rabbitmq.host:localhost}
+    port: ${campus.canteen.rabbitmq.port:5672}
+    username: ${campus.canteen.rabbitmq.username:guest}
+    password: ${campus.canteen.rabbitmq.password:guest}
+    virtual-host: /
+  cache:
+    type: redis
+    redis:
+      time-to-live: 30m
+
+mybatis:
+  #mapper配置文件
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.campus.canteen.entity
+  configuration:
+    #开启驼峰命名
+    map-underscore-to-camel-case: true
+
+logging:
+  level:
+    com:
+      campus:
+        canteen:
+          # 生产建议改为 info —— mapper 打 debug 会把每条 SQL 和参数都刷进日志，量大且低效
+          mapper: info
+          service: info
+          controller: info
+
+campus:
+  canteen:
+    jwt:
+      # ⚠ 本地开发用的占位密钥。真实部署请改为环境变量注入，且长度至少 32 字节。
+      # 生成方式：openssl rand -base64 48
+      admin-secret-key: ${JWT_ADMIN_SECRET:change-me-admin-secret-at-least-32-bytes-long}
+      # 设置jwt过期时间（毫秒）
+      admin-ttl: 720000000
+      # 设置前端传递过来的令牌名称
+      admin-token-name: token
+      user-secret-key: ${JWT_USER_SECRET:change-me-user-secret-at-least-32-bytes-long}
+      user-ttl: 720000000
+      user-token-name: authentication
+
+    # 阿里云OSS配置（真实值走环境变量，见 application-dev.yml）
+    alioss:
+      endpoint: ${campus.canteen.alioss.endpoint}
+      accessKeyId: ${campus.canteen.alioss.accessKeyId}
+      accessKeySecret: ${campus.canteen.alioss.accessKeySecret}
+      bucketName: ${campus.canteen.alioss.bucketName}
+
+    wechat:
+      appid: ${campus.canteen.wechat.appid}
+      secret: ${campus.canteen.wechat.secret}
+
+  ai:
+    system-prompt: |
+      你是校园食堂智能助手"渔政"，请用可爱、亲切且充满温暖的语气与同学交流。
+
+      【ReAct 工作模式】严格按以下格式：
+      1. Thought: 分析用户意图
+      2. 如需工具 → Action: 工具名 / Action Input: 参数
+      3. 信息足够 → Final Answer: 回答
+
+      【规则】
+      1. 不编造任何数据，工具无结果时如实告知
+      2. 当用户询问食堂或学校相关信息时（菜品、价格、营业时间、退款、支付方式、地址、食堂名单、学校介绍等），
+         必须先调用工具查询真实数据，禁止凭训练记忆直接回答，禁止跳过工具直接输出 Final Answer
+      3. searchKnowledge 是你的核心知识库工具，凡是涉及食堂政策、学校信息、校园生活的问题，必须调用它；涉及菜品搜索用 searchDishes；涉及订单查询用 getOrderStatus
+
+      【格式示例】
+      示例1 - 查知识库：
+      Thought: 用户问退款规则，我需要查知识库
+      Action: searchKnowledge
+      Action Input: 退款规则
+
+      示例2 - 搜菜品：
+      Thought: 用户想搜辣的菜品
+      Action: searchDishes
+      Action Input: 辣
+
+      示例3 - 不需要工具：
+      Thought: 用户在打招呼，不需要调用工具
+      Final Answer: 同学你好呀～有什么可以帮你的吗？
+
+      注意：Action Input 只写简洁的查询关键词，不要写完整句子或多余解释。
+    long-term-memory:
+      enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+springdoc:
+  group-configs:
+    - group: 管理端
+      paths-to-match: /admin/**
+    - group: 用户端
+      paths-to-match: /user/**
+
+resilience4j:
+  ratelimiter:
+    instances:
+      orderSubmit:
+        limitForPeriod: 500
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0
+  circuitbreaker:
+    instances:
+      paymentService:
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
