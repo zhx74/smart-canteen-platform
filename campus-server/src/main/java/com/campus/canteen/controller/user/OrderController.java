@@ -9,6 +9,7 @@ import com.campus.canteen.vo.OrderPaymentVO;
 import com.campus.canteen.vo.OrderSubmitVO;
 import com.campus.canteen.vo.OrderVO;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import io.swagger.v3.oas.annotations.Operation;
@@ -37,7 +38,18 @@ public class OrderController {
     }
 
     public Result<OrderSubmitVO> fallback(OrdersSubmitDTO ordersSubmitDTO, Throwable t) {
-        return Result.error("请求过于频繁，请稍后重试");
+        // ⚠️ 只对"限流拒绝"降级。Resilience4j 的 fallbackMethod 会被被注解方法抛出的
+        // 任何异常触发（压测实证：100 个请求全部进了业务逻辑、90 个因库存不足抛出
+        // 业务异常，却都返回了这里的限流文案）。若无差别返回限流提示，真实原因就被
+        // 吞掉了。所以非限流异常必须原样抛回，交给 GlobalExceptionHandler 处理。
+        if (t instanceof RequestNotPermitted) {
+            log.warn("下单接口触发限流（orderSubmit），已降级：{}", t.getMessage());
+            return Result.error("请求过于频繁，请稍后重试");
+        }
+        if (t instanceof RuntimeException) {
+            throw (RuntimeException) t;
+        }
+        throw new RuntimeException(t);
     }
 
     /**

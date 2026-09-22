@@ -55,6 +55,8 @@ public class JwtTokenAdminInterceptor implements HandlerInterceptor {
             return true;
         } catch (Exception ex) {
             //4、不通过，响应401状态码
+            // ⚠️ 与用户端拦截器保持一致：必须记录失败原因，静默 401 会让并发下的偶发失败无法排查
+            log.warn("管理端 JWT 校验失败，token={}", token, ex);
             response.setStatus(401);
             return false;
         }

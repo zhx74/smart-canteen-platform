@@ -55,6 +55,9 @@ public class JwtTokenUserInterceptor implements HandlerInterceptor {
             return true;
         } catch (Exception ex) {
             //4、不通过，响应401状态码
+            // ⚠️ 这里必须记录原因。之前是静默 setStatus(401)，导致"合法 token 偶发被判未登录"
+            // 这类并发问题完全无法排查（压测下表现为 0.5% 左右的请求返回 401，日志里毫无痕迹）。
+            log.warn("用户端 JWT 校验失败，token={}", token, ex);
             response.setStatus(401);
             return false;
         }
