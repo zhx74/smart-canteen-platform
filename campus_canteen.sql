@@ -65,19 +65,21 @@ CREATE TABLE `dish` (
   `image` varchar(255) DEFAULT NULL COMMENT '图片',
   `description` varchar(255) DEFAULT NULL COMMENT '描述信息',
   `status` int(11) DEFAULT '1' COMMENT '0停售 1起售',
+  `stock` int(11) NOT NULL DEFAULT '0' COMMENT '库存，下单扣减、取消归还',
   `create_time` datetime DEFAULT NULL COMMENT '创建时间',
   `update_time` datetime DEFAULT NULL COMMENT '更新时间',
   `create_user` bigint(20) DEFAULT NULL COMMENT '创建人',
   `update_user` bigint(20) DEFAULT NULL COMMENT '修改人',
   PRIMARY KEY (`id`),
-  UNIQUE KEY `idx_dish_name` (`name`)
+  UNIQUE KEY `idx_dish_name` (`name`),
+  CONSTRAINT `chk_dish_stock` CHECK (`stock` >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='菜品';
 
 -- 插入示例数据
 INSERT INTO `dish` VALUES 
-(1, '麻婆豆腐', 1, 18.00, 'https://example.com/mapo.jpg', '经典川菜，麻辣鲜香', 1, NOW(), NOW(), 1, 1),
-(2, '宫保鸡丁', 2, 28.00, 'https://example.com/gongbao.jpg', '酸甜微辣，口感丰富', 1, NOW(), NOW(), 1, 1),
-(3, '清蒸鲈鱼', 3, 58.00, 'https://example.com/luyu.jpg', '鲜嫩可口，营养丰富', 1, NOW(), NOW(), 1, 1);
+(1, '麻婆豆腐', 1, 18.00, 'https://example.com/mapo.jpg', '经典川菜，麻辣鲜香', 1, 100, NOW(), NOW(), 1, 1),
+(2, '宫保鸡丁', 2, 28.00, 'https://example.com/gongbao.jpg', '酸甜微辣，口感丰富', 1, 100, NOW(), NOW(), 1, 1),
+(3, '清蒸鲈鱼', 3, 58.00, 'https://example.com/luyu.jpg', '鲜嫩可口，营养丰富', 1, 100, NOW(), NOW(), 1, 1);
 
 -- ----------------------------
 -- 4. 菜品口味表 (dish_flavor)
@@ -116,6 +118,7 @@ CREATE TABLE `setmeal` (
   UNIQUE KEY `idx_setmeal_name` (`name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='套餐';
 
+-- 套餐不单独记库存，下单时按 setmeal_dish 展开成组成菜品扣减菜品库存
 -- 插入示例数据
 INSERT INTO `setmeal` VALUES 
 (1, 4, '营养套餐A', 35.00, 1, '包含一荤两素一汤', 'https://example.com/setmeal-a.jpg', NOW(), NOW(), 1, 1),
@@ -226,7 +229,9 @@ CREATE TABLE `orders` (
   `pack_amount` int(11) DEFAULT NULL COMMENT '打包费',
   `tableware_number` int(11) DEFAULT NULL COMMENT '餐具数量',
   `tableware_status` tinyint(1) NOT NULL DEFAULT '1' COMMENT '餐具数量状态 1按餐量提供 0选择具体数量',
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `idx_user_time` (`user_id`, `order_time`),
+  KEY `idx_status_time` (`status`, `order_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
 
 -- ----------------------------

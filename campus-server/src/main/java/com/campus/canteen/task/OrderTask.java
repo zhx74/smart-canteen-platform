@@ -17,24 +17,11 @@ public class OrderTask {
     @Autowired
     private OrderMapper orderMapper;
 
-    // 处理超时订单的方法
-    // TODO: 已迁移到 RabbitMQ 延时队列，此定时任务已退役
-    // @Scheduled(cron = "0 * * * * ?")
-    public void processTimeOutOrder() {
-        log.info("定时处理超时订单：{}", LocalDateTime.now());
-
-        LocalDateTime time = LocalDateTime.now().plusMinutes(-15);
-        List<Orders> ordersList = orderMapper.getByStatusAndOrderTimeLT(Orders.PENDING_PAYMENT, time);
-
-        if (ordersList != null && !ordersList.isEmpty()) {
-            for (Orders orders : ordersList) {
-                orders.setStatus(Orders.CANCELLED);
-                orders.setCancelReason("订单超时，自动取消");
-                orders.setCancelTime(LocalDateTime.now());
-                orderMapper.update(orders);
-            }
-        }
-    }
+    /*
+     * 超时未支付订单的取消**只走一条路径**：RabbitMQ 延时队列（order.delay.queue，
+     * 见 OrderDelayConsumer）。不设定时扫盘兜底——两条路径并存会带来"谁先到谁生效"
+     * 之外的额外认知成本，且条件更新本身已保证幂等，重复触发没有收益。
+     */
 
     @Scheduled(cron = "0 0 1 * * ?")
     public void processDeliveryOrder() {

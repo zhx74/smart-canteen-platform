@@ -1,6 +1,7 @@
 package com.campus.canteen.service;
 
 import com.campus.canteen.dto.*;
+import com.campus.canteen.entity.Orders;
 import com.campus.canteen.result.PageResult;
 import com.campus.canteen.vo.OrderPaymentVO;
 import com.campus.canteen.vo.OrderStatisticsVO;
@@ -105,6 +106,16 @@ public interface OrderService {
 
     // 客户催单
     void reminder(Long id);
+
+    /**
+     * 取消订单并归还库存（幂等）。用户取消、商家拒单、商家取消、超时自动取消
+     * 所有入口统一走这里，重复调用只会生效一次，不会重复归还库存。
+     *
+     * @param orderId      订单id
+     * @param cancelFields 取消时需要一并写入的字段（取消原因、拒单原因、退款状态等），可为 null
+     * @return true 表示本次真正完成了取消，false 表示订单此前已被取消
+     */
+    boolean cancelOrderAndRestoreStock(Long orderId, Orders cancelFields);
 }
 
 

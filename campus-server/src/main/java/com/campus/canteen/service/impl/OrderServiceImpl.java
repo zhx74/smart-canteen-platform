@@ -38,6 +38,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -63,6 +65,10 @@ public class OrderServiceImpl implements OrderService {
     private RedissonClient redissonClient;
     @Autowired
     private PlatformTransactionManager transactionManager;
+    @Autowired
+    private DishMapper dishMapper;
+    @Autowired
+    private SetmealDishMapper setmealDishMapper;
 
     // 用户下单
     @Override
@@ -72,8 +78,24 @@ public class OrderServiceImpl implements OrderService {
         // 按用户粒度加分布式锁：争抢的资源是"这个用户的购物车"，防止双击/并发重复下单。
         // 锁必须在事务外层——保证解锁前事务已提交，否则第二个线程可能在"锁已释放、数据未提交"
         // 的窗口里读到旧购物车，重复单依然防不住。
+        //
+        // 用 tryLock(3s) 而不是 lock()：lock() 是无等待上限的阻塞，同一用户并发时后续请求会一直挂起。
+        // 一旦持锁线程卡住（慢 SQL、行锁等待），挂起的线程会占满 Tomcat 工作线程把整个服务拖垮，
+        // 而且看门狗仍在续期、锁永不自动释放，这个"卡住"可能是永久的。等待上限 + 快速失败才是对的。
+        //
+        // 只传 waitTime、不传 leaseTime：传了 leaseTime 会关掉看门狗，
+        // 业务跑超过租约时间时锁被自动释放，第二个线程即可进入临界区，互斥随即失效。
         RLock lock = redissonClient.getLock("order:submit:" + userId);
-        lock.lock();
+        boolean locked;
+        try {
+            locked = lock.tryLock(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new OrderBusinessException(MessageConstant.ORDER_SUBMIT_TOO_FREQUENT);
+        }
+        if (!locked) {
+            throw new OrderBusinessException(MessageConstant.ORDER_SUBMIT_TOO_FREQUENT);
+        }
         try {
             // 编程式事务，让 DB 写入的提交发生在锁释放之前
             TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
@@ -122,6 +144,9 @@ public class OrderServiceImpl implements OrderService {
             throw new ShoppingCartBusinessException(MessageConstant.SHOPPING_CART_IS_NULL);
         }
 
+        // 先扣库存再落单：库存不足会抛异常，整个事务回滚，订单/明细/购物车都不会留下痕迹
+        deductStock(shoppingCartList);
+
         // 创建订单实体
         Orders order = new Orders();
         BeanUtils.copyProperties(ordersSubmitDTO, order);
@@ -151,6 +176,93 @@ public class OrderServiceImpl implements OrderService {
         shoppingCartMapper.deleteByUserId(userId);
 
         return order;
+    }
+
+    /**
+     * 扣减库存。以菜品为维度聚合后按 dishId 升序逐条扣减：
+     * - 聚合：同一道菜在购物车里可能出现多行（不同口味），套餐还要按 setmeal_dish 展开
+     * - 升序：多个订单同时扣多道菜时，加锁顺序一致才不会交叉死锁
+     * 判断与扣减在同一条 UPDATE 内完成，影响行数为 0 即库存不足，
+     * 抛异常交由外层事务整体回滚。
+     */
+    private void deductStock(List<ShoppingCart> shoppingCartList) {
+        Map<Long, Integer> dishQty = new TreeMap<>();
+        for (ShoppingCart cart : shoppingCartList) {
+            accumulateDishQty(dishQty, cart.getDishId(), cart.getSetmealId(), cart.getNumber());
+        }
+
+        for (Map.Entry<Long, Integer> entry : dishQty.entrySet()) {
+            if (dishMapper.deductStock(entry.getKey(), entry.getValue()) == 0) {
+                throw new OrderBusinessException(MessageConstant.STOCK_NOT_ENOUGH);
+            }
+        }
+    }
+
+    /**
+     * 把一条购物车（或订单明细）展开累加到"菜品 → 数量"的映射中。
+     * 单品直接累加；套餐按 setmeal_dish 展开成组成菜品，数量为 copies × 该行份数。
+     * 购物车里可能同时存在单品和含同一道菜的套餐，必须累加到同一条目，
+     * 否则同一道菜会被分两批扣减，升序加锁的防死锁效果随之失效。
+     */
+    private void accumulateDishQty(Map<Long, Integer> dishQty, Long dishId, Long setmealId, Integer number) {
+        int qty = number == null ? 0 : number;
+        if (qty <= 0) {
+            return;
+        }
+
+        if (dishId != null) {
+            dishQty.merge(dishId, qty, Integer::sum);
+            return;
+        }
+
+        if (setmealId != null) {
+            for (SetmealDish setmealDish : setmealDishMapper.getBySetmealId(setmealId)) {
+                int copies = setmealDish.getCopies() == null ? 0 : setmealDish.getCopies();
+                if (copies > 0) {
+                    dishQty.merge(setmealDish.getDishId(), copies * qty, Integer::sum);
+                }
+            }
+        }
+    }
+
+    /**
+     * 取消订单并归还库存。用户取消、商家拒单、商家取消、超时自动取消四个入口统一走这里。
+     * 用条件更新（仅 status in (1,2,3,4) 的"进行中"订单可取消）保证幂等：
+     * 只有抢到本次状态变更的调用才归还库存；重复调用、已完成订单被误取消等情况影响行数为 0，直接跳过。
+     */
+    @Override
+    public boolean cancelOrderAndRestoreStock(Long orderId, Orders cancelFields) {
+        TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+        return Boolean.TRUE.equals(transactionTemplate.execute(status -> {
+            if (orderMapper.cancelIfNotCancelled(orderId) == 0) {
+                log.info("订单此前已取消，跳过库存归还，订单ID: {}", orderId);
+                return Boolean.FALSE;
+            }
+
+            // 取消原因、拒单原因、退款状态等由各入口自行决定，一并写入
+            if (cancelFields != null) {
+                cancelFields.setId(orderId);
+                orderMapper.update(cancelFields);
+            }
+
+            restoreStockByOrderId(orderId);
+            return Boolean.TRUE;
+        }));
+    }
+
+    /**
+     * 按订单明细归还库存。展开规则与下单扣减完全一致（套餐按 setmeal_dish 的 copies 展开），
+     * 保证"怎么扣的就怎么还"。
+     */
+    private void restoreStockByOrderId(Long orderId) {
+        Map<Long, Integer> dishQty = new TreeMap<>();
+        for (OrderDetail detail : orderDetailMapper.getByOrderId(orderId)) {
+            accumulateDishQty(dishQty, detail.getDishId(), detail.getSetmealId(), detail.getNumber());
+        }
+
+        for (Map.Entry<Long, Integer> entry : dishQty.entrySet()) {
+            dishMapper.restoreStock(entry.getKey(), entry.getValue());
+        }
     }
 
     /**
@@ -253,17 +365,14 @@ public class OrderServiceImpl implements OrderService {
             throw new OrderBusinessException(MessageConstant.ORDER_STATUS_ERROR);
         }
 
-        Orders orders = new Orders();
-        orders.setId(ordersDB.getId());
-
+        Orders cancelFields = new Orders();
+        cancelFields.setCancelReason("用户取消");
         if (ordersDB.getStatus().equals(Orders.TO_BE_CONFIRMED)) {
-            orders.setPayStatus(Orders.REFUND);
+            cancelFields.setPayStatus(Orders.REFUND);
         }
 
-        orders.setStatus(Orders.CANCELLED);
-        orders.setCancelReason("用户取消");
-        orders.setCancelTime(LocalDateTime.now());
-        orderMapper.update(orders);
+        // 取消 + 归还库存。status 与 cancel_time 由条件更新写入，重复调用不会重复归还
+        cancelOrderAndRestoreStock(id, cancelFields);
     }
 
     /**
@@ -368,13 +477,11 @@ public class OrderServiceImpl implements OrderService {
             log.info("申请退款");
         }
 
-        Orders orders = new Orders();
-        orders.setId(ordersDB.getId());
-        orders.setStatus(Orders.CANCELLED);
-        orders.setRejectionReason(ordersRejectionDTO.getRejectionReason());
-        orders.setCancelTime(LocalDateTime.now());
+        Orders cancelFields = new Orders();
+        cancelFields.setRejectionReason(ordersRejectionDTO.getRejectionReason());
 
-        orderMapper.update(orders);
+        // 取消 + 归还库存（幂等）
+        cancelOrderAndRestoreStock(ordersDB.getId(), cancelFields);
     }
 
     /**
@@ -382,6 +489,16 @@ public class OrderServiceImpl implements OrderService {
      */
     public void cancel(OrdersCancelDTO ordersCancelDTO) throws Exception {
         Orders ordersDB = orderMapper.getById(ordersCancelDTO.getId());
+        if (ordersDB == null) {
+            throw new OrderBusinessException(MessageConstant.ORDER_NOT_FOUND);
+        }
+
+        // 只有"进行中"的订单才可取消。这个校验必须挡在退款之前，
+        // 否则会出现"钱已退、订单却没被取消"的不一致
+        Integer status = ordersDB.getStatus();
+        if (status == null || status < Orders.PENDING_PAYMENT || status > Orders.DELIVERY_IN_PROGRESS) {
+            throw new OrderBusinessException(MessageConstant.ORDER_STATUS_ERROR);
+        }
 
         Integer payStatus = ordersDB.getPayStatus();
         if (payStatus == 1) {
@@ -393,12 +510,11 @@ public class OrderServiceImpl implements OrderService {
             log.info("申请退款");
         }
 
-        Orders orders = new Orders();
-        orders.setId(ordersCancelDTO.getId());
-        orders.setStatus(Orders.CANCELLED);
-        orders.setCancelReason(ordersCancelDTO.getCancelReason());
-        orders.setCancelTime(LocalDateTime.now());
-        orderMapper.update(orders);
+        Orders cancelFields = new Orders();
+        cancelFields.setCancelReason(ordersCancelDTO.getCancelReason());
+
+        // 取消 + 归还库存（幂等）
+        cancelOrderAndRestoreStock(ordersDB.getId(), cancelFields);
     }
 
     /**

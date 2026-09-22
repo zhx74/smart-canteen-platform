@@ -8,7 +8,9 @@ import com.campus.canteen.enumeration.OperationType;
 import com.campus.canteen.vo.DishVO;
 import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 import java.util.List;
 import java.util.Map;
@@ -64,6 +66,27 @@ public interface DishMapper {
      * @return
      */
     Integer countByMap(Map map);
+
+    /**
+     * 条件扣减库存。判断与扣减在同一条语句内完成，由 InnoDB 行锁保证原子性，
+     * 因此不需要再加分布式锁。
+     *
+     * @param dishId 菜品id
+     * @param number 扣减数量
+     * @return 影响行数，1 表示扣减成功，0 表示库存不足
+     */
+    @Update("update dish set stock = stock - #{number} where id = #{dishId} and stock >= #{number}")
+    int deductStock(@Param("dishId") Long dishId, @Param("number") Integer number);
+
+    /**
+     * 归还库存，订单取消或超时未支付时调用
+     *
+     * @param dishId 菜品id
+     * @param number 归还数量
+     * @return 影响行数
+     */
+    @Update("update dish set stock = stock + #{number} where id = #{dishId}")
+    int restoreStock(@Param("dishId") Long dishId, @Param("number") Integer number);
 }
 
 

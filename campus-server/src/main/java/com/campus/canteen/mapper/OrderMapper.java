@@ -5,6 +5,7 @@ import com.campus.canteen.dto.GoodsSalesDTO;
 import com.campus.canteen.dto.OrdersPageQueryDTO;
 import com.campus.canteen.entity.Orders;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
@@ -33,6 +34,20 @@ public interface OrderMapper {
     Orders getById(Long id);
 
     void update(Orders orders);
+
+    /**
+     * 把订单标记为已取消（条件更新，status = 6 表示已取消）。
+     * 限定 status in (1,2,3,4)（待付款/待接单/已接单/派送中），即只有"进行中"的订单才能被取消：
+     * - 返回 1 表示本次真正完成了取消，调用方据此归还库存
+     * - 返回 0 表示订单已完成、已取消，或已被其他线程/重复投递的消息处理过，此时不归还库存
+     * 既避免重复归还导致库存虚增，也避免把已完成订单改成已取消。
+     *
+     * @param id 订单id
+     * @return 影响行数
+     */
+    @Update("update orders set status = 6, cancel_time = now() " +
+            "where id = #{id} and status in (1, 2, 3, 4)")
+    int cancelIfNotCancelled(@Param("id") Long id);
 
     /**
      * 根据状态统计订单数�?

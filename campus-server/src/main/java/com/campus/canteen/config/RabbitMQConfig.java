@@ -47,6 +47,13 @@ public class RabbitMQConfig {
     // 路由键
     public static final String ORDER_DELAY_ROUTING_KEY = "order.delay";
 
+    // 延时队列的死信交换机 / 死信队列 / 死信路由键
+    // 消费者抛 AmqpRejectAndDontRequeueException（或消息 TTL 到期、队列超长）时，消息转投到这里，
+    // 而不是被静默丢弃 —— 超时取消订单只有 MQ 一条路径，失败消息必须有落点。
+    public static final String ORDER_DELAY_DLX = "order.delay.dlx";
+    public static final String ORDER_DELAY_DLQ = "order.delay.dlq";
+    public static final String ORDER_DELAY_DLQ_ROUTING_KEY = "order.delay.dlq";
+
     /**
      * 创建延时交换机（使用 x-delayed-message 类型）
      */
@@ -58,11 +65,43 @@ public class RabbitMQConfig {
     }
 
     /**
-     * 创建延时队列
+     * 创建延时队列。
+     * 绑定死信交换机：消费失败被 reject 的消息不再原地丢弃，而是投到 order.delay.dlq。
      */
     @Bean
     public Queue orderDelayQueue() {
-        return QueueBuilder.durable(ORDER_DELAY_QUEUE).build();
+        return QueueBuilder.durable(ORDER_DELAY_QUEUE)
+                .deadLetterExchange(ORDER_DELAY_DLX)
+                .deadLetterRoutingKey(ORDER_DELAY_DLQ_ROUTING_KEY)
+                .build();
+    }
+
+    /**
+     * 延时队列的死信交换机（普通 direct 交换机即可，不需要 x-delayed-message）
+     */
+    @Bean
+    public DirectExchange orderDelayDlx() {
+        return ExchangeBuilder.directExchange(ORDER_DELAY_DLX).durable(true).build();
+    }
+
+    /**
+     * 死信队列。这里只做"落点"，不挂消费者：
+     * 消息进来说明超时取消失败，需要人工或运维脚本查看后决定重放还是手工归还库存。
+     * 一旦给它挂上自动消费者，就等于又造了一条隐式重试链路，反而掩盖问题。
+     */
+    @Bean
+    public Queue orderDelayDlq() {
+        return QueueBuilder.durable(ORDER_DELAY_DLQ).build();
+    }
+
+    /**
+     * 死信队列绑定到死信交换机
+     */
+    @Bean
+    public Binding orderDelayDlqBinding(Queue orderDelayDlq, DirectExchange orderDelayDlx) {
+        return BindingBuilder.bind(orderDelayDlq)
+                .to(orderDelayDlx)
+                .with(ORDER_DELAY_DLQ_ROUTING_KEY);
     }
 
     /**
