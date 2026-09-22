@@ -29,7 +29,8 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -60,11 +61,53 @@ public class OrderServiceImpl implements OrderService {
     private RabbitTemplate rabbitTemplate;
     @Autowired
     private RedissonClient redissonClient;
+    @Autowired
+    private PlatformTransactionManager transactionManager;
 
     // 用户下单
-    @Transactional
     @Override
     public OrderSubmitVO submitOrder(OrdersSubmitDTO ordersSubmitDTO) {
+        Long userId = BaseContext.getCurrentId();
+
+        // 按用户粒度加分布式锁：争抢的资源是"这个用户的购物车"，防止双击/并发重复下单。
+        // 锁必须在事务外层——保证解锁前事务已提交，否则第二个线程可能在"锁已释放、数据未提交"
+        // 的窗口里读到旧购物车，重复单依然防不住。
+        RLock lock = redissonClient.getLock("order:submit:" + userId);
+        lock.lock();
+        try {
+            // 编程式事务，让 DB 写入的提交发生在锁释放之前
+            TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+            Orders order = transactionTemplate.execute(status -> doSubmitOrder(ordersSubmitDTO, userId));
+
+            // 事务提交后再发延时消息（15 分钟后检查是否支付），避免回滚了却仍发出超时取消消息
+            long delayMillis = 15 * 60 * 1000;
+            rabbitTemplate.convertAndSend(
+                RabbitMQConfig.ORDER_DELAYED_EXCHANGE,
+                RabbitMQConfig.ORDER_DELAY_ROUTING_KEY,
+                order.getId(),
+                message -> {
+                    message.getMessageProperties().setDelay((int) delayMillis);
+                    return message;
+                }
+            );
+            log.info("订单创建成功，订单ID: {}, 已发送延时消息", order.getId());
+
+            return OrderSubmitVO.builder()
+                    .id(order.getId())
+                    .orderTime(order.getOrderTime())
+                    .orderNumber(order.getNumber())
+                    .orderAmount(order.getAmount())
+                    .build();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 下单核心逻辑，运行在事务内。购物车查询与判空都在锁内执行，
+     * 确保并发/重复提交时第二个请求读到的是已清空的购物车。
+     */
+    private Orders doSubmitOrder(OrdersSubmitDTO ordersSubmitDTO, Long userId) {
         // 处理各种业务异常(地址簿为空，购物车数据为空)
         AddressBook addressBook = addressBookMapper.getById(ordersSubmitDTO.getAddressBookId());
         if (addressBook == null) {
@@ -72,31 +115,15 @@ public class OrderServiceImpl implements OrderService {
         }
 
         // 查询当前用户购物车数据
-        Long userId = BaseContext.getCurrentId();
         ShoppingCart shoppingCart = new ShoppingCart();
         shoppingCart.setUserId(userId);
         List<ShoppingCart> shoppingCartList = shoppingCartMapper.list(shoppingCart);
-
         if (shoppingCartList == null || shoppingCartList.isEmpty()) {
             throw new ShoppingCartBusinessException(MessageConstant.SHOPPING_CART_IS_NULL);
         }
 
-        // 提取购物车中的菜品/套餐ID，按单品加锁，不相关的菜品互不阻塞
-        List<String> lockKeys = shoppingCartList.stream()
-                .map(cart -> cart.getDishId() != null
-                        ? "order:dish:" + cart.getDishId()
-                        : "order:setmeal:" + cart.getSetmealId())
-                .distinct()
-                .toList();
-
-        RLock[] locks = lockKeys.stream()
-                .map(key -> redissonClient.getLock(key))
-                .toArray(RLock[]::new);
-        RLock multiLock = redissonClient.getMultiLock(locks);
-        multiLock.lock();
-        try {
-            // 创建订单实体
-            Orders order = new Orders();
+        // 创建订单实体
+        Orders order = new Orders();
         BeanUtils.copyProperties(ordersSubmitDTO, order);
         order.setPhone(addressBook.getPhone());
         order.setAddress(addressBook.getDetail());
@@ -123,32 +150,7 @@ public class OrderServiceImpl implements OrderService {
         // 清空购物车
         shoppingCartMapper.deleteByUserId(userId);
 
-        // 发送延时消息（15分钟后检查是否支付）
-        long delayMillis = 15 * 60 * 1000; // 15分钟
-        rabbitTemplate.convertAndSend(
-            RabbitMQConfig.ORDER_DELAYED_EXCHANGE,
-            RabbitMQConfig.ORDER_DELAY_ROUTING_KEY,
-            order.getId(),
-            message -> {
-                message.getMessageProperties().setDelay((int) delayMillis);
-                return message;
-            }
-        );
-
-        log.info("订单创建成功，订单ID: {}, 已发送延时消息", order.getId());
-
-        // 构建返回结果
-        OrderSubmitVO orderSubmitVO = OrderSubmitVO.builder()
-                .id(order.getId())
-                .orderTime(order.getOrderTime())
-                .orderNumber(order.getNumber())
-                .orderAmount(order.getAmount())
-                .build();
-
-            return orderSubmitVO;
-        } finally {
-            multiLock.unlock();
-        }
+        return order;
     }
 
     /**
