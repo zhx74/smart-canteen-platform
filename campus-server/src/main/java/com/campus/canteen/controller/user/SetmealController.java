@@ -29,7 +29,7 @@ public class SetmealController {
      * @param categoryId
      * @return
      */
-    @Cacheable(cacheNames = "setmealCache", key = "#categoryId")
+    @Cacheable(cacheNames = "setmealCache", key = "#categoryId", sync = true)
     @GetMapping("/list")
     @Operation(summary = "根据分类id查询套餐")
     public Result<List<Setmeal>> list(Long categoryId) {

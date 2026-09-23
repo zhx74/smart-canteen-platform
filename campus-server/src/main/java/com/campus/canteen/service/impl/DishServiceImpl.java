@@ -184,7 +184,7 @@ public class DishServiceImpl implements DishService {
     }
 
     // 根据分类id来查询菜�?
-    @Cacheable(value = "dishes", key = "#categoryId")
+    @Cacheable(value = "dishes", key = "#categoryId", sync = true)
     @Override
     public List<Dish> list(Long categoryId) {
         Dish dish = Dish.builder()
@@ -200,7 +200,7 @@ public class DishServiceImpl implements DishService {
      * @param dish
      * @return
              */
-    @Cacheable(value = "dishWithFlavors", key = "#dish.categoryId ?: 'all'")
+    @Cacheable(value = "dishWithFlavors", key = "#dish.categoryId ?: 'all'", sync = true)
     public List<DishVO> listWithFlavor(Dish dish) {
         List<Dish> dishList = dishMapper.list(dish);
 
